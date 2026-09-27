@@ -1,0 +1,81 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      demo_bug:
+        description: "Enable the deliberate thermal off-by-one (1 = on) for this run"
+        required: false
+        default: "0"
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and run unit tests
+        id: test
+        env:
+          DEMO_BUG: ${{ github.event.inputs.demo_bug }}
+        run: |
+          gcc --version | head -1
+          if [ "${DEMO_BUG:-0}" = "1" ]; then
+            make test DEMO_BUG=1
+          else
+            make test
+          fi
+
+      - name: Upload JUnit report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit-xml
+          path: build/junit.xml
+          if-no-files-found: warn
+
+      - name: Post results to V-Model agent
+        # Runs even if tests failed (a red run is exactly what the agent needs to see).
+        # Never fails the build: skipped when the URL var is unset, errors are only warnings.
+        if: always()
+        continue-on-error: true
+        env:
+          INGEST_URL: ${{ vars.VMODEL_INGEST_URL }}
+          CI_SECRET: ${{ secrets.VMODEL_CI_SECRET }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "${INGEST_URL}" ]; then
+            echo "VMODEL_INGEST_URL is not set - skipping post to V-Model agent."
+            exit 0
+          fi
+          if [ ! -f build/junit.xml ]; then
+            echo "::warning::build/junit.xml not found - nothing to post."
+            exit 0
+          fi
+          jq -n \
+            --arg repo "$REPO" \
+            --arg sha "$SHA" \
+            --arg run_url "$RUN_URL" \
+            --rawfile junit_xml build/junit.xml \
+            '{repo: $repo, sha: $sha, run_url: $run_url, junit_xml: $junit_xml}' > payload.json
+          status=$(curl -sS -o response.txt -w '%{http_code}' \
+            --max-time 30 --retry 2 --retry-connrefused \
+            -X POST "$INGEST_URL" \
+            -H 'content-type: application/json' \
+            -H "x-ci-secret: ${CI_SECRET}" \
+            --data-binary @payload.json) || status="unreachable"
+          echo "V-Model ingest responded: ${status}"
+          head -c 2000 response.txt 2>/dev/null || true
+          echo
+          case "$status" in
+            2??) ;;
+            *) echo "::warning::V-Model ingest post failed (${status}); build result unaffected." ;;
+          esac
+          exit 0
